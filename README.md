@@ -22,4 +22,4 @@ ssh -p2222 user@localhost
 
 ## How does it work
 
-I will write a blog soon, see [jm33.me](https://jm33.me)
+See my [blog post](https://jm33.me/sshd-injection-and-password-harvesting.html)
