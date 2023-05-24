@@ -304,9 +304,14 @@ void* monitor(void* arg)
 
 void __attribute__((constructor)) initLibrary(void)
 {
+    puts("Loaded");
     PID = getpid();
+    printf("Loading harvester shared library to SSHD process %d\n", PID);
     pthread_t thread_id;
     pthread_create(&thread_id, NULL, monitor, NULL);
 }
 
-void __attribute__((destructor)) cleanUpLibrary(void) { }
+void __attribute__((destructor)) cleanUpLibrary(void)
+{
+    printf("Unloading harvester shared library to SSHD process %d\n", PID);
+}
